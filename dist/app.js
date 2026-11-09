@@ -6,9 +6,26 @@ const svg=name=>'<svg class="icon" aria-hidden="true"><use href="#i-'+name+'"/><
 const storage="roleta-brasileirao-v1";
 const checkpoint=storage+"-checkpoint";
 function read(key){try{const value=JSON.parse(localStorage.getItem(key));return value?.version===1?value:null;}catch{return null;}}
-let state=read(storage)??G.fresh(), locked=false, turns=0, toastTimer;
+function loadCampaign(saved){
+ const campaign={...G.fresh(),...saved};
+ delete campaign.streak;
+ delete campaign.best;
+ delete campaign.achievements;
+ if(campaign.run&&!campaign.run.done&&(
+  (campaign.run.mode==="liga"&&!campaign.run.league)||
+  (campaign.run.mode==="copa"&&campaign.run.seq.length!==1)
+ )){
+  campaign.run=null;
+  campaign.last=null;
+  campaign.eventRolled=false;
+  campaign.entered=false;
+  G.write(campaign,"Formato da competição atualizado","Escolha uma competição para começar no formato novo. Seu elenco e seus troféus estão disponíveis.");
+ }
+ return campaign;
+}
+let state=loadCampaign(read(storage)), locked=false, toastTimer, phase="event";
 const pages=[
- ["roleta","wheel","Roleta"],["elenco","shirt","Meu elenco"],["competicoes","cup","Competições"],["regioes","map","Mapa regional"],
+ ["roleta","wheel","Roleta"],["elenco","shirt","Meu elenco"],["competicoes","cup","Competições"],["classificacao","cup","Classificação"],["regioes","map","Mapa regional"],
  ["mercado","shop","Mercado"],["itens","box","Itens"],["historico","history","Histórico"]
 ];
 const slices=[
@@ -26,7 +43,7 @@ const action=(id,label,css="",attrs="")=>'<button type="button" class="'+css+'" 
 const tile=(icon,title,detail,controls="",cls="")=>'<article class="card tile '+cls+'"><span class="tile-icon">'+svg(icon)+'</span><div class="tile-content"><h3>'+title+'</h3><p>'+detail+'</p>'+controls+'</div></article>';
 const empty=msg=>'<div class="empty">'+msg+'</div>';
 const tag=(label,kind="")=>'<span class="tag '+kind+'">'+label+'</span>';
-const regionNames=["Norte","Nordeste","Sudeste","Sul"];
+const regionNames=G.regionalOrder;
 function save(show=false){
  try{localStorage.setItem(storage,JSON.stringify(state));if(show)toast("Campanha salva neste navegador.");}
  catch{if(show)toast("O navegador bloqueou o armazenamento.");}
@@ -43,49 +60,115 @@ function close(){if($("#modal").open)$("#modal").close();}
 function page(){const hash=location.hash.slice(1);return pages.some(p=>p[0]===hash)?hash:"roleta";}
 function go(where){if(page()===where)render();else location.hash=where;}
 function progress(){
- const best=state.record.liga?.w??0;
- return '<div class="side-goal"><span class="goal-icon">'+svg("cup")+'</span><span class="overline">META DA TEMPORADA</span><strong>O sonho do 38–0</strong><div class="meter"><i style="width:'+best/38*100+'%"></i></div><small>'+best+' / 38 vitórias</small><a href="#competicoes">Ver campanha '+svg("arrow")+'</a></div>';
+ const titles=["liga","copa"].filter(id=>state.record[id]?.title).length;
+ return '<div class="side-goal"><span class="goal-icon">'+svg("cup")+'</span><span class="overline">RUMO À LIBERTADORES</span><strong>'+titles+' / 2 títulos nacionais</strong><div class="meter"><i style="width:'+titles*50+'%"></i></div><a href="#competicoes">Ver competições '+svg("arrow")+'</a></div>';
 }
 function render(){
  const current=page(), run=state.run;
+ document.body.classList.toggle("journey",current==="roleta");
  $("#top-actions").innerHTML='<span class="money">'+svg("coin")+' <b>'+cash(state.bank)+'</b></span>'+action("save",svg("save")+' <span>Salvar</span>',"btn mini");
  $("#nav").innerHTML=pages.map(([id,icon,label])=>'<a href="#'+id+'" class="'+(current===id?"active":"")+'" '+(current===id?'aria-current="page"':"")+'>'+svg(icon)+' <span>'+label+'</span>'+(id==="mercado"&&state.events.length?'<b class="nav-count">'+state.events.length+'</b>':"")+'</a>').join("");
  $("#side-goal").innerHTML=progress();
- const screens={roleta:home,elenco:squad,competicoes:competitions,regioes:regions,mercado:market,itens:items,historico:history};
+ const screens={roleta:home,elenco:squad,competicoes:competitions,classificacao:classification,regioes:regions,mercado:market,itens:items,historico:history};
  $("#main").innerHTML=screens[current](run);
  if(current==="roleta")drawWheel();
  save();
 }
+
+function wheelSectors(){
+ const starters=G.starters(state);
+ const open=G.slotRoles(state.formation).filter((_,i)=>!starters[i]);
+ let entries=slices.map(([label,icon,color])=>({label,icon,color}));
+ if(phase==="match"){
+  const {win,draw,loss}=G.probabilities(state,G.opponent(state));
+  entries=[{label:"VITÓRIA",icon:"cup",color:"#218453",weight:win}];
+  if(draw)entries.push({label:draw>.07?"EMPATE":"",icon:"ball",color:"#896831",weight:draw});
+  entries.push({label:loss>.07?"DERROTA":"",icon:"shield",color:"#853a3d",weight:loss});
+ }else if(open.length){
+  const positions=state.draftMode==="position"?[...new Set(open)]:Object.keys(G.role);
+  entries=positions.map((p,i)=>({label:G.role[p].toUpperCase(),icon:p==="G"?"shield":"shirt",color:["#15845f","#3869b1","#967831","#8c4d69"][i],pos:p,weight:state.draftMode==="position"?open.filter(x=>x===p).length/open.length:1/positions.length}));
+ }
+ if(entries.length===1)entries=[{...entries[0],weight:.5},{...entries[0],weight:.5}];
+ let start=-90-(entries[0].weight??1/entries.length)*180;
+ return entries.map(e=>{const from=start;start+=(e.weight??1/entries.length)*360;return {...e,from,to:start,center:(from+start)/2};});
+}
+function weightedSector(sectors,roll){
+ let cumulative=0;
+ return sectors.find(s=>{cumulative+=s.weight;return roll<cumulative;})??sectors.at(-1);
+}
+function animateWheel(sector,finish){
+ locked=true;
+ const button=$(".spin-btn");
+ button.disabled=true;
+ $("#wheel-art").style.transform="rotate("+(360*4-sector.center-90)+"deg)";
+ setTimeout(()=>{locked=false;finish();},matchMedia("(prefers-reduced-motion: reduce)").matches?50:1750);
+}
+
 function drawWheel(){
  const holder=$("#wheel-art");
  if(!holder)return;
- const sector=360/slices.length, rad=a=>a*Math.PI/180;
+ const sectors=wheelSectors(), rad=a=>a*Math.PI/180;
  const point=(r,a)=>[180+Math.cos(rad(a))*r,180+Math.sin(rad(a))*r];
  const dots=Array.from({length:40},(_,i)=>{const [x,y]=point(172,i*9);return '<circle cx="'+x+'" cy="'+y+'" r="'+(i%5===0?2.1:1.2)+'" fill="'+(i%5===0?"#ffe89a":"#a28b4e")+'"/>';}).join("");
- const paths=slices.map(([label,icon,color],i)=>{
-  const center=i*sector-90, [x1,y1]=point(164,center-sector/2),[x2,y2]=point(164,center+sector/2);
+ const paths=sectors.map(({label,icon,color,center,from,to})=>{
+  const [x1,y1]=point(164,from),[x2,y2]=point(164,to);
+  const angle=(center+90+360)%360, rotate=angle>95&&angle<265?angle-180:angle;
   const [tx,ty]=point(124,center),[ix,iy]=point(98,center);
-  return '<path d="M180 180L'+x1+' '+y1+'A164 164 0 0 1 '+x2+' '+y2+'Z" fill="'+color+'" stroke="#81bf9c" stroke-opacity=".38"/><g transform="rotate('+i*sector+' '+tx+' '+ty+')"><text x="'+tx+'" y="'+ty+'" text-anchor="middle" dominant-baseline="middle">'+label+'</text></g><use href="#i-'+icon+'" x="'+(ix-9)+'" y="'+(iy-9)+'" width="18" height="18" stroke="#d2eadc" fill="none" stroke-width="1.6" transform="rotate('+i*sector+' '+ix+' '+iy+')"/>';
+  return '<path d="M180 180L'+x1+' '+y1+'A164 164 0 '+(to-from>180?1:0)+' 1 '+x2+' '+y2+'Z" fill="'+color+'" stroke="#81bf9c" stroke-opacity=".38"/><g transform="rotate('+rotate+' '+tx+' '+ty+')"><text x="'+tx+'" y="'+ty+'" text-anchor="middle" dominant-baseline="middle">'+label+'</text></g><use href="#i-'+icon+'" x="'+(ix-9)+'" y="'+(iy-9)+'" width="18" height="18" stroke="#d2eadc" fill="none" stroke-width="1.6" transform="rotate('+rotate+' '+ix+' '+iy+')"/>';
  }).join("");
  holder.innerHTML='<svg class="wheel-svg" viewBox="0 0 360 360" aria-hidden="true"><defs><radialGradient id="wheelLight"><stop offset="0" stop-color="#011810" stop-opacity=".7"/><stop offset="1" stop-color="#54ffae" stop-opacity=".12"/></radialGradient><linearGradient id="rim" x2="1" y2="1"><stop stop-color="#ffe5a2"/><stop offset=".5" stop-color="#9f7833"/><stop offset="1" stop-color="#eecb6e"/></linearGradient></defs><circle cx="180" cy="180" r="178" fill="#151e17" stroke="url(#rim)" stroke-width="2"/>'+paths+'<circle cx="180" cy="180" r="164" fill="url(#wheelLight)" stroke="url(#rim)" stroke-width="1.5"/>'+dots+'</svg>';
 }
+
+function routeCards(){
+ return regionNames.map((name,i)=>{
+  const won=state.regionalTitles.includes(name), enabled=i===0||state.regionalTitles.includes(regionNames[i-1]);
+  const count=G.clubs.filter(c=>c.region===name).length;
+  return action("route",'<span class="route-icon">'+svg(enabled?"map":"lock")+'</span><span><b>'+name+'</b><small>'+(won?"Insígnia conquistada":enabled?count+" "+(count===1?"desafio":"desafios"):"Vença a região "+regionNames[i-1])+'</small></span>',"route-card "+(won?"won":""),'data-id="'+name+'" '+(enabled?"":"disabled"));
+ }).join("");
+}
+function intro(){
+ return '<section class="journey-intro"><span class="overline">O FUTEBOL BRASILEIRO EM UMA ROLETA</span><h1>Escolha sua competição</h1><p>Monte seus 11 titulares e conquiste os dois títulos nacionais para liberar a Libertadores.</p>'+
+ '<div class="intro-modes">'+action("begin",svg("cup")+' <b>Brasileirão</b><small>20 clubes · 38 rodadas · pontos corridos</small>',"intro-mode",'data-id="liga"')+
+ action("begin",svg("shield")+' <b>Copa do Brasil</b><small>Uma partida · vitória ou derrota</small>',"intro-mode",'data-id="copa"')+'</div>'+
+ (G.unlocked(state)?action("begin",svg("cup")+' Disputar a Libertadores',"btn primary",'data-id="lib"'):"")+'</section>';
+}
+function dugout(){
+ const roles=G.slotRoles(state.formation);
+ const slots=G.starters(state).map((p,i)=>'<span class="dugout-player '+(p?"filled":"")+'" title="'+safe(p?p.name+" · "+p.ovr+" OVR":G.role[roles[i]])+'">'+(p?'<b>'+p.ovr+'</b><small>'+safe(p.name)+'</small>':svg("shirt"))+'</span>').join("");
+ const pins=regionNames.map(name=>'<span class="medal '+(state.regionalTitles.includes(name)?"earned":"")+'" title="'+name+'">'+({Norte:"N",Nordeste:"NE",Sul:"S",Sudeste:"SE"}[name])+'</span>').join("");
+ const cups=["liga","copa","lib"].map(id=>'<span class="medal '+(state.record[id]?.title?"earned":"")+'" title="'+G.modes[id].name+'">'+svg("cup")+'</span>').join("");
+ const bag=Object.entries(G.items).filter(([id])=>state.items[id]>0).map(([id,it])=>action("use-item",svg(it.icon)+" "+it.name+" ×"+state.items[id],"bag-item",'data-id="'+id+'" title="'+safe(it.desc)+'"')).join("");
+ return '<aside class="dugout" aria-label="Equipe, insígnias e mochila"><section class="card content"><div class="between"><h2>Equipe</h2>'+tag(G.rating(state)+" OVR","green")+'</div><div class="dugout-team">'+slots+'</div><a href="#elenco" class="btn mini">'+svg("shirt")+' Gerenciar elenco</a></section>'+
+ '<section class="card content"><h2>Insígnias</h2><div class="medals">'+pins+cups+'</div><a href="#regioes">Ver rota regional '+svg("arrow")+'</a></section>'+
+ '<section class="card content"><div class="between"><h2>Mochila</h2>'+tag(Object.values(state.items).reduce((a,b)=>a+b,0)+" ITENS")+'</div><div class="bag">'+(bag||'<small class="muted">Mochila vazia.</small>')+'</div><a href="#itens">Abrir inventário '+svg("arrow")+'</a></section></aside>';
+}
 function home(run){
+ if(!state.entered)return '<div class="adventure">'+intro()+dugout()+'</div>';
  const mode=G.modes[state.mode], ready=G.starters(state).filter(Boolean).length;
- const last=state.last;
- return '<section class="hero"><div class="hero-inner"><span class="hero-label">'+svg("ball")+' SIMULADOR DE FUTEBOL</span><h1>ROLETA DO<br><em>BRASILEIRÃO</em></h1><p>Monte seu elenco, encare o imprevisto e faça história no futebol brasileiro.</p><div class="hero-tags">'+tag("20 CLUBES")+' '+tag("TEMPORADA 2026")+' '+tag("CAMINHO À TRÍPLICE COROA")+'</div></div><div class="hero-stamp"><b>26</b><small>SÉRIE A</small></div></section>'+
- '<div class="section-kicker"><span><i></i> DIA DE JOGO</span><span>BRASIL <b> / </b> TEMPORADA 2026</span></div>'+
- '<div class="dashboard"><section class="card roulette"><div class="panel-head"><div class="head-icon">'+svg("wheel")+'</div><div><h2>Roleta de eventos</h2><p>O próximo giro pode mudar tudo.</p></div>'+tag("AO VIVO","green")+'</div><div class="wheel-area"><div class="wheel-wrap"><div class="pointer"></div><div id="wheel-art"></div><div class="wheel-hub">'+svg("ball")+'</div></div></div><div class="wheel-footer">'+action("spin",svg("wheel")+" GIRAR ROLETA","btn primary spin-btn",(locked?"disabled":""))+'<p>'+(state.draft?"Você tem uma escolha pendente.":"Elenco, reforços e surpresas a cada giro")+'</p></div></section>'+
- '<div class="match-column">'+match(run)+
- '<section class="card compact"><div class="panel-head"><div class="head-icon">'+svg("shirt")+'</div><div><h2>Seu elenco</h2><p>Formação '+safe(state.formation)+' · '+(ready===11?"Pronto para jogar":"Em montagem")+'</p></div><strong class="line-count">'+ready+'<small>/11</small></strong></div><div class="meter"><i style="width:'+ready/11*100+'%"></i></div><div class="compact-foot"><a href="#elenco">Gerenciar escalação '+svg("arrow")+'</a><span>'+G.rating(state)+' OVR</span></div></section>'+
- '<section class="card compact ticker"><div class="panel-head"><div class="head-icon gold">'+svg("zap")+'</div><div><h2>Central de eventos</h2><p>'+(state.events.length?state.events.length+' evento(s) aguardando decisão':last?'Último jogo · '+last.score.join(" × ")+' '+safe(nameOf(last.rival)):'Os eventos da campanha aparecem aqui.')+'</p></div></div><a href="#mercado">Abrir central '+svg("arrow")+'</a></section></div></div>'+
- '<section class="card bottom-stat"><span>'+svg("cup")+' <b>'+(state.record.liga?.w??0)+'/38</b> melhor Brasileirão</span><span>'+svg("zap")+' <b>'+state.streak+'/82</b> sequência atual</span><span>'+svg("map")+' <b>'+Object.values(state.regions).flat().length+'/20</b> clubes vencidos na Série A</span></section>';
+ const round=(run?.played??0)+1, rival=G.opponent(state);
+ const title=run?.done?(run.won?"Campanha conquistada!":"Fim da tentativa"):phase==="match"?"Vai começar a partida!":ready<11?"Quem entra em campo?":state.eventRolled?"Hora da partida":"O que acontece nesta rodada?";
+ const context=state.mode==="regional"?state.region:mode.name;
+ const nextRegion=run?.won&&state.mode==="regional"?regionNames[regionNames.indexOf(state.region)+1]:null;
+ const caption=run?.done?run.w+' vitórias · '+run.d+' empates · '+run.l+' derrotas':phase==="match"?"A roleta decide o resultado. Sua equipe e seus itens mudam as chances.":ready<11?"Gire e escolha um reforço para completar sua escalação.":'Próximo desafio: '+rival?.name+' · '+state.stadium;
+ return '<div class="adventure"><section class="journey-stage"><div class="stage-title"><span class="overline">'+safe(context)+' · '+(run?.done?"FIM DA CAMPANHA":"DESAFIO "+round+"/"+G.rounds(state))+'</span><h1>'+title+'</h1><p>'+safe(caption)+'</p></div>'+
+ (run?.done?'<div class="end-stage">'+svg(run.won?"cup":"history")+'<div class="actions">'+(nextRegion?action("route","Avançar para "+nextRegion,"btn primary",'data-id="'+nextRegion+'"'):action("retry","Nova tentativa","btn primary"))+'<a href="#competicoes" class="btn">Competições</a><a href="#regioes" class="btn">Mapa regional</a></div></div>':
+ '<div class="wheel-area"><div class="wheel-wrap"><div class="pointer"></div><div id="wheel-art"></div><div class="wheel-hub">'+svg("ball")+'</div></div></div><div class="wheel-footer">'+
+ (phase==="match"?action("resolve-match",svg("ball")+" GIRAR PARTIDA","btn primary spin-btn",locked?"disabled":""):action("spin",svg("wheel")+(state.draft?" RETOMAR ESCOLHA":ready<11?" GIRAR REFORÇO":state.eventRolled?" EVENTO CONCLUÍDO":" GIRAR EVENTO"),"btn primary spin-btn",locked||(ready===11&&state.eventRolled&&!state.draft)?"disabled":""))+
+ (phase==="match"?'<p>'+chanceText(rival)+'</p>':"")+'</div>')+
+ (phase==="match"||run?.done?"":match(run))+
+ (state.mode==="liga"?'<div class="standings-link"><a class="btn" href="#classificacao">Ver classificação '+svg("arrow")+'</a></div>':"")+'</section>'+dugout()+'</div>';
+}
+
+function chanceText(rival){
+ const {win,draw,loss}=G.probabilities(state,rival);
+ return pct(win)+' vitória'+(draw?' · '+pct(draw)+' empate':"")+' · '+pct(loss)+' derrota';
 }
 function match(run){
  const rival=G.opponent(state), own=G.getClub(state.emblem), mode=G.modes[state.mode], round=(run?.played??0)+1;
  const derby=G.isDerby(state,rival);
  const ready=G.starters(state).filter(Boolean).length===11;
- return '<section class="card match"><div class="panel-head"><div class="head-icon gold">'+svg("cup")+'</div><div><h2>'+(run?.done?"Campanha encerrada":"Próxima partida")+'</h2><p>'+mode.name+' · '+mode.short+'</p></div>'+tag(run?.done?"FINAL":String(round).padStart(2,"0")+" / "+mode.length,derby?"gold":"")+'</div>'+
- (rival?'<div class="versus"><div>'+crest(own)+'<strong>'+safe(own.name)+'</strong><small>SEU EMBLEMA</small></div><b>VS</b><div>'+crest(rival)+'<strong>'+safe(rival.name)+'</strong><small>'+rival.ovr+' OVR</small></div></div><div class="stadium">'+svg("pin")+' '+safe(state.stadium)+(derby?" · Clássico":"")+'</div><div class="match-foot">'+action("play",svg("ball")+" Jogar partida","btn play")+'<small>'+(ready?pct(G.odds(state,rival))+' de chance de vitória':'Escale 11 titulares para jogar')+'</small></div>':
+ return '<section class="card match"><div class="panel-head"><div class="head-icon gold">'+svg("cup")+'</div><div><h2>'+(run?.done?"Campanha encerrada":"Próxima partida")+'</h2><p>'+mode.name+' · '+mode.short+'</p></div>'+tag(run?.done?"FINAL":String(round).padStart(2,"0")+" / "+G.rounds(state),derby?"gold":"")+'</div>'+
+ (rival?'<div class="versus"><div>'+crest(own)+'<strong>'+safe(own.name)+'</strong><small>SEU EMBLEMA</small></div><b>VS</b><div>'+crest(rival)+'<strong>'+safe(rival.name)+'</strong><small>'+G.opponentRating(state,rival)+' OVR</small></div></div><div class="stadium">'+svg("pin")+' '+safe(state.stadium)+(derby?" · Clássico":"")+'</div><div class="match-foot">'+action("play",svg("ball")+" Jogar partida","btn play")+'<small>'+(ready?chanceText(rival):'Escale 11 titulares para jogar')+'</small></div>':
  '<div class="empty"><strong>'+(run?.won?"Troféu conquistado":"Tente outra campanha")+'</strong><br>'+run.w+' V · '+run.d+' E · '+run.l+' D</div><div class="match-foot"><a class="btn play" href="#competicoes">Ver competições '+svg("arrow")+'</a></div>')+'</section>';
 }
 function heading(label,title,desc){
@@ -110,21 +193,35 @@ function squad(){
  '<section class="card content"><div class="between"><h2>Registros da Série A 2026</h2>'+tag("FONTE CBF")+'</div><p class="muted">Atletas que constavam com o clube atual correspondente na CBF. A roleta usa uma seleção desses nomes, com posições agrupadas e OVR próprios.</p><div class="club-grid">'+G.clubs.map(c=>action("club",crest(c)+'<span>'+safe(c.name)+'<small>'+c.names.length+' atletas</small></span>',"club-card",'data-id="'+c.id+'"')).join("")+'</div></section>';
 }
 function competitions(){
- const cards=Object.entries(G.modes).map(([id,m])=>{
+ const cards=Object.entries(G.modes).filter(([id])=>id!=="regional").map(([id,m])=>{
   const closed=id==="lib"&&!G.unlocked(state);
   const record=state.record[id], active=state.mode===id&&state.run&&!state.run.done;
-  const desc=id==="liga"?"38 rodadas. O título no simulador pede 76 pontos. Vença as 38 para liberar a Libertadores.":id==="copa"?"Mata-mata compacto. Vença sete partidas seguidas para levantar a taça.":"Seis jogos na fase de grupos e sete no mata-mata. A fase de grupos exige três vitórias.";
+  const desc=id==="liga"?"20 clubes em 38 rodadas. O líder da classificação final conquista o título.":id==="copa"?"Uma partida decide a taça. A roleta tem chances de vitória e derrota.":"Conquiste o Brasileirão e a Copa do Brasil para liberar a disputa continental.";
   return tile(closed?"lock":"cup",m.name,desc,(record?.title?tag("CAMPEÃO","gold"):"")+(active?tag("EM ANDAMENTO","green"):"")+
    '<div class="actions">'+action("mode",closed?"Bloqueada":active?"Continuar":state.run?.done&&state.mode===id?"Nova campanha":"Selecionar","btn "+(active?"primary":""),'data-id="'+id+'" '+(closed?"disabled":""))+'</div>',closed?"locked":"");
  }).join("");
- const unlocked=G.unlocked(state), triple=!!(state.record.liga?.perfect&&state.record.copa?.title&&state.record.lib?.title);
+ const unlocked=G.unlocked(state), triple=!!(unlocked&&state.record.lib?.title);
  return heading("SALA DE TROFÉUS","Competições","Do campeonato nacional à glória continental.")+
  '<div class="split"><div class="stack">'+cards+'</div><section class="card content goals"><h2>Desafios da campanha</h2>'+tag(triple?"TRÍPLICE COROA CONQUISTADA":unlocked?"LIBERTADORES LIBERADA":"RUMO À TRÍPLICE COROA","gold")+
- '<div class="goal-row"><b>38–0 no Brasileirão</b><strong>'+(state.record.liga?.w??0)+' / 38</strong></div><div class="goal-row"><b>Campeão da Copa do Brasil</b><strong>'+(state.record.copa?.title?"✓":"—")+'</strong></div><div class="goal-row"><b>82 vitórias seguidas</b><strong>'+Math.min(82,state.best)+' / 82</strong></div><p class="muted">A sequência de 82 pode atravessar competições e temporadas. Empates ou derrotas zeram a sequência atual.</p><label class="field-label">Restrição de OVR<select id="challenge" '+(state.run&&!state.run.done?"disabled":"")+'><option value="open">Sem restrição</option><option value="sub78" '+(state.challenge==="sub78"?"selected":"")+'>Até 78 OVR</option><option value="elite" '+(state.challenge==="elite"?"selected":"")+'>A partir de 80 OVR</option></select></label></section></div>';
+ '<div class="goal-row"><b>Campeão do Brasileirão</b><strong>'+(state.record.liga?.title?"✓":"—")+'</strong></div><div class="goal-row"><b>Campeão da Copa do Brasil</b><strong>'+(state.record.copa?.title?"✓":"—")+'</strong></div><label class="field-label">Restrição de OVR<select id="challenge" '+(state.run&&!state.run.done?"disabled":"")+'><option value="open">Sem restrição</option><option value="sub78" '+(state.challenge==="sub78"?"selected":"")+'>Até 78 OVR</option><option value="elite" '+(state.challenge==="elite"?"selected":"")+'>A partir de 80 OVR</option></select></label></section></div>';
+}
+function classification(){
+ const league=state.run?.league??state.lastLeague;
+ const rows=G.standings(state);
+ const emblem=league?.emblem??state.emblem;
+ const played=rows[0].played;
+ const title=played===38?"CLASSIFICAÇÃO FINAL":"RODADA "+played+" / 38";
+ const columns=["Pos.","Clube","OVR","PTS","J","V","E","D","GP","GC","SG"];
+ return heading("SÉRIE A 2026","Classificação do Brasileirão","Os outros nove jogos são simulados a cada rodada com base no overall dos titulares de cada clube.")+
+ '<section class="card content"><div class="between"><h2>Tabela de pontos corridos</h2>'+tag(title,"green")+'</div><p class="muted">Desempate por vitórias, saldo de gols e gols marcados. O primeiro colocado ao fim das 38 rodadas fica com a taça.</p>'+
+ '<div class="table-scroll" tabindex="0" role="region" aria-label="Classificação dos 20 clubes"><table class="league-table"><thead><tr>'+columns.map(label=>'<th scope="col">'+label+'</th>').join("")+'</tr></thead><tbody>'+
+ rows.map((r,i)=>'<tr class="'+(r.id===emblem?"own-row":"")+'"><td>'+(i+1)+'</td><th scope="row">'+crest(G.getClub(r.id))+safe(nameOf(r.id))+(r.id===emblem?' <small>Seu time</small>':"")+'</th>'+
+ [r.ovr??(G.rating(state)||"—"),r.points,r.played,r.w,r.d,r.l,r.gf,r.ga,r.gd].map(value=>'<td>'+value+'</td>').join("")+'</tr>').join("")+'</tbody></table></div></section>'+
+ (league?.results.length?'<section class="card content"><h2>Resultados da rodada '+played+'</h2><div class="round-results">'+league.results.map(({home,away,hg,ag})=>'<div><span>'+safe(nameOf(home))+'</span><b>'+hg+' × '+ag+'</b><span>'+safe(nameOf(away))+'</span></div>').join("")+'</div></section>':"");
 }
 function regions(){
  return heading("EXPEDIÇÃO NACIONAL","Mapa regional","Vença cada clube para completar sua coleção. As quatro regiões têm representantes na Série A de 2026.")+
- '<div class="region-grid">'+regionNames.map(r=>{
+ '<section class="card content"><h2>Desafios em ordem</h2><div class="route-list">'+routeCards()+'</div></section><div class="region-grid">'+regionNames.map(r=>{
   const clubs=G.clubs.filter(c=>c.region===r), done=state.regions[r]??[];
   return '<section class="card content region"><div class="between"><h2>'+r+'</h2>'+tag(done.length===clubs.length?"CONQUISTADA":done.length+" / "+clubs.length,done.length===clubs.length?"gold":"green")+'</div><div class="meter"><i style="width:'+done.length/clubs.length*100+'%"></i></div><div class="club-grid">'+clubs.map(c=>'<div class="club-card '+(done.includes(c.id)?"conquered":"")+'">'+crest(c)+'<span>'+safe(c.name)+'<small>'+c.uf+' · '+(done.includes(c.id)?"Vencido":"Pendente")+'</small></span></div>').join("")+'</div></section>';
  }).join("")+'</div>';
@@ -157,9 +254,9 @@ function showDraft(){
  const list=d.options.map(p=>playerRow(p,action("pick","Escolher","btn mini primary",'data-id="'+p.id+'"'))).join("");
  dialog("Escolha seu jogador",'<p class="muted">'+(d.pos?"Posição sorteada: "+pos+".":"Escolha o jogador e depois a posição dele no seu time.")+'</p>'+list+(list?"":empty("Todos os jogadores desta posição já foram contratados.")), "RESULTADO DA ROLETA");
 }
-function openDraft(){
+function openDraft(forcedPosition=null){
  if(!state.draft){
-  const pos=state.draftMode==="position"?G.proposedRole(state):null;
+  const pos=state.draftMode==="position"?(typeof forcedPosition==="string"&&G.role[forcedPosition]?forcedPosition:G.proposedRole(state)):null;
   const options=G.draft(state,pos);
   if(!options.length){toast("Nenhum atleta novo para esta posição.");return;}
   state.draft={pos,options};save();
@@ -180,16 +277,13 @@ function randomStadium(){
 function spin(){
  if(locked)return;
  if(state.draft){showDraft();return;}
- if(state.team.length<11){turns=0;}
- const sector=state.team.length<11||!G.starters(state).every(Boolean)&&turns%2===0?0:G.choose([0,0,0,1,2,3,4,5,6,7]);
- turns++;locked=true;
- const art=$("#wheel-art"), spinButton=$(".spin-btn");
- spinButton.disabled=true;
- art.style.transform="rotate("+(360*4-sector*45)+"deg)";
- const reduce=matchMedia("(prefers-reduced-motion: reduce)").matches;
- setTimeout(()=>{
-  locked=false;
-  if(sector===0){openDraft();render();return;}
+ const sectors=wheelSectors(), needsPlayers=!G.starters(state).every(Boolean);
+ if(!needsPlayers&&state.eventRolled)return;
+ const choice=needsPlayers?weightedSector(sectors,Math.random()):sectors[G.choose([0,0,0,1,2,3,4,5,6,7])];
+ const sector=needsPlayers?0:sectors.indexOf(choice);
+ animateWheel(choice,()=>{
+  if(!needsPlayers)state.eventRolled=true;
+  if(sector===0){if(page()==="roleta")openDraft(choice.pos);render();return;}
   let result;
   if(sector===1)result=randomCoach();
   if(sector===2)result=randomStadium();
@@ -216,7 +310,7 @@ function spin(){
   }
   G.write(state,result[0],result[1],"good");render();
   if(page()==="roleta")dialog(safe(result[0]),'<p class="muted">'+safe(result[1])+'</p><div class="actions">'+action("close","Continuar","btn primary")+'</div>',"RESULTADO DA ROLETA");
- },reduce?50:1750);
+ });
 }
 function playerChoice(id){
  const d=state.draft,p=d?.options.find(x=>x.id===id);
@@ -293,11 +387,26 @@ function use(id){
  }
  G.write(state,G.items[id].name,"Item usado.","good");render();toast(G.items[id].name+" ativado.");
 }
-function kick(){
+function validateMatch(){
  if(state.bank<0){toast("Caixa negativo. Venda um jogador ou resolva eventos antes de jogar.");return;}
  if(state.events.some(e=>["sale","trade","exit"].includes(e.type))){toast("Resolva os eventos obrigatórios na diretoria.");go("mercado");return;}
  if(G.starters(state).some(p=>!p)){toast("Escale 11 jogadores saudáveis antes da partida.");go("elenco");return;}
- const result=G.play(state);
+ return true;
+}
+function kick(){
+ if(!validateMatch()||!G.opponent(state))return;
+ if(!state.eventRolled){toast("Gire o evento da rodada para liberar a partida.");return;}
+ if(state.draft){showDraft();return;}
+ if((state.challenge==="sub78"&&G.rating(state)>78)||(state.challenge==="elite"&&G.rating(state)<80)){toast("A escalação não atende à restrição de OVR.");return;}
+ phase="match";render();
+}
+function resolveMatch(){
+ if(locked||!validateMatch())return;
+ const roll=Math.random(), sector=weightedSector(wheelSectors(),roll);
+ animateWheel(sector,()=>{phase="event";finishMatch(roll);});
+}
+function finishMatch(roll){
+ const result=G.play(state,roll);
  if(!result){toast("A escalação não atende à restrição de OVR desta campanha.");return;}
  const rival=G.getClub(result.rival), title=result.result==="V"?"Vitória!":result.result==="E"?"Empate":"Derrota";
  render();
@@ -308,16 +417,32 @@ function kick(){
 }
 function switchMode(id){
  if(id==="lib"&&!G.unlocked(state))return;
- if(id===state.mode&&!state.run?.done){go("roleta");return;}
+ if(id===state.mode&&!state.run?.done){state.entered=true;go("roleta");return;}
  if(state.run&&!state.run.done){
-  dialog("Trocar de competição?",'<p class="muted">A campanha atual será encerrada. O elenco, a sequência de vitórias e os troféus já conquistados ficam no seu save.</p><div class="actions">'+action("mode-confirm","Trocar competição","btn primary",'data-id="'+id+'"')+action("close","Voltar","btn")+'</div>');
+  dialog("Trocar de competição?",'<p class="muted">A campanha atual será encerrada. Seu elenco e seus troféus continuam no save.</p><div class="actions">'+action("mode-confirm","Trocar competição","btn primary",'data-id="'+id+'"')+action("close","Voltar","btn")+'</div>');
   return;
  }
  setMode(id);
 }
 function setMode(id){
- state.mode=id;state.run=null;state.last=null;state.market=null;close();go("roleta");
+ if(state.run)state.attempt++;
+ phase="event";state.entered=true;state.mode=id;state.run=null;state.last=null;state.market=null;state.eventRolled=false;
+ state.region=id==="regional"?state.nextRegion:null;
+ state.firstOpponent=id==="regional"?G.choose(G.clubs.filter(c=>c.region===state.region)).id:id==="liga"?(state.emblem==="COR"?"FLA":"COR"):id==="lib"?"BOC":G.choose(G.clubs.filter(c=>c.id!==state.emblem)).id;
+ if(state.stadiumMode==="every")state.stadium=G.choose(G.clubs).stadium;
+ close();go("roleta");
 }
+
+function route(name){
+ const i=regionNames.indexOf(name);
+ if(i<0||i>0&&!state.regionalTitles.includes(regionNames[i-1]))return;
+ if(state.mode==="regional"&&state.region===name&&state.run&&!state.run.done){go("roleta");return;}
+ state.nextRegion=name;
+ if(state.run&&!state.run.done){
+  dialog("Entrar no desafio regional?",'<p class="muted">A tentativa atual será encerrada. Seu elenco e suas conquistas continuam no save.</p><div class="actions">'+action("mode-confirm","Entrar em "+name,"btn primary",'data-id="regional"')+action("close","Voltar","btn")+'</div>');
+ }else setMode("regional");
+}
+
 function sell(id,value){
  const p=state.team.find(x=>x.id===id);
  if(!p)return;
@@ -337,7 +462,7 @@ const actions={
  auto:()=>{G.auto(state);render();toast("Escalação atualizada. A seleção prioriza jogadores descansados.");},
  coach:()=>{const r=randomCoach();render();toast(r.join(" · "));},
  stadium:()=>{const r=randomStadium();render();toast(r[0]);},
- play:kick,mode:switchMode,"mode-confirm":setMode,
+ play:kick,"resolve-match":resolveMatch,route,begin:setMode,retry:()=>{if(state.mode==="regional")state.nextRegion=state.region;setMode(state.mode);},mode:switchMode,"mode-confirm":setMode,
  club:id=>{
   const c=G.getClub(id);
   dialog(safe(c.name),'<p class="muted">'+c.names.length+' registros com este clube no campo Clube Atual. <a href="'+c.source+'" target="_blank" rel="noopener">Consultar na CBF '+svg("arrow")+'</a></p><ul class="names">'+c.names.map(p=>'<li>'+safe(p)+'</li>').join("")+'</ul>',"SÉRIE A 2026");
@@ -368,9 +493,9 @@ const actions={
   if(!read(checkpoint)){toast("Nenhum checkpoint foi criado.");return;}
   dialog("Recuperar checkpoint?",'<p class="muted">O progresso após o checkpoint será substituído.</p><div class="actions">'+action("restore-confirm","Recuperar","btn primary")+action("close","Voltar","btn")+'</div>');
  },
- "restore-confirm":()=>{const restored=read(checkpoint);if(restored){state=restored;close();render();toast("Checkpoint recuperado.");}},
+ "restore-confirm":()=>{const restored=read(checkpoint);if(restored){state=loadCampaign(restored);phase="event";close();render();toast("Checkpoint recuperado.");}},
  reset:()=>dialog("Apagar sua campanha?",'<p class="muted">Esta ação remove a campanha e seu checkpoint deste navegador.</p><div class="actions">'+action("reset-confirm","Apagar campanha","btn danger")+action("close","Cancelar","btn")+'</div>'),
- "reset-confirm":()=>{state=G.fresh();try{localStorage.removeItem(checkpoint);}catch{}close();go("roleta");}
+ "reset-confirm":()=>{state=G.fresh();phase="event";try{localStorage.removeItem(checkpoint);}catch{}close();go("roleta");}
 };
 document.addEventListener("click",e=>{
  const el=e.target.closest("[data-act]");
@@ -387,5 +512,9 @@ document.addEventListener("change",e=>{
  render();
 });
 $("#modal").addEventListener("click",e=>{if(e.target===$("#modal"))close();});
-window.addEventListener("hashchange",()=>{render();window.scrollTo({top:0});});
+window.addEventListener("hashchange",()=>{if(!locked)phase="event";render();window.scrollTo({top:0});});
 render();
+
+
+
+

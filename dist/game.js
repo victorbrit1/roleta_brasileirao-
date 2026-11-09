@@ -73,9 +73,11 @@ const coaches=[
  {name:"O Motivador",passive:"+9 p.p. de vitória em clássicos",derby:0.09},
  {name:"O Formador",passive:"+2 OVR efetivos para reforços",youth:2}
 ];
+const regionalOrder=["Norte","Nordeste","Sul","Sudeste"];
 const modes={
+ regional:{name:"Rota regional",short:"Desafio",length:0},
  liga:{name:"Brasileirão",short:"Série A",length:38},
- copa:{name:"Copa do Brasil",short:"Mata-mata",length:7},
+ copa:{name:"Copa do Brasil",short:"Jogo único",length:1},
  lib:{name:"Libertadores",short:"Continental",length:13}
 };
 const items={
@@ -90,22 +92,78 @@ const choose=a=>a[Math.floor(Math.random()*a.length)];
 const mix=a=>{const b=[...a];for(let i=b.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[b[i],b[j]]=[b[j],b[i]];}return b;};
 const clamp=(n,a,b)=>Math.min(b,Math.max(a,n));
 const getClub=id=>teams.find(c=>c.id===id);
+const regionalClubs=s=>clubs.filter(c=>c.region===s.region);
+const rounds=s=>s.mode==="regional"?regionalClubs(s).length:modes[s.mode].length;
 const healthy=p=>p.injury===0;
 const live=p=>({...p,injury:0,streak:0,bench:0,contract:12,unhappy:false});
 const slotRoles=f=>["G",...formations[f].flatMap((n,i)=>Array(n).fill("DMA"[i]))];
 function calendar(mode,emblem){
  const pool=mix(clubs.filter(c=>c.id!==emblem)).map(c=>c.id);
- if(mode==="liga") return [...pool,...pool];
- if(mode==="copa") return pool.slice(0,7);
+ if(mode==="copa") return pool.slice(0,1);
  return [...mix(continental).map(c=>c.id),...mix([...continental.map(c=>c.id),...pool.slice(0,4)]).slice(0,5)];
+}
+const clubStrengths=Object.fromEntries(clubs.map(club=>{
+ const roster=players.filter(p=>p.club===club.id).sort((a,b)=>b.ovr-a.ovr);
+ const lineup=["G","D","M","A"].flatMap((pos,i)=>roster.filter(p=>p.pos===pos).slice(0,[1,4,3,3][i]));
+ return [club.id,Math.round(lineup.reduce((sum,p)=>sum+p.ovr,0)/lineup.length)];
+}));
+function leagueCalendar(emblem,first){
+ const rotation=mix(clubs.map(c=>c.id));
+ const turn=Array.from({length:rotation.length-1},(_,round)=>{
+  const fixtures=rotation.slice(0,rotation.length/2).map((id,i)=>{
+   const other=rotation[rotation.length-1-i];
+   return i===0&&round%2===1?[other,id]:[id,other];
+  });
+  rotation.splice(1,0,rotation.pop());
+  return fixtures;
+ });
+ const opening=turn.findIndex(fixtures=>fixtures.some(pair=>pair.includes(emblem)&&pair.includes(first)));
+ if(opening>0)turn.push(...turn.splice(0,opening));
+ return [...turn,...turn.map(fixtures=>fixtures.map(([home,away])=>[away,home]))];
+}
+function tableFor(emblem){
+ return Object.fromEntries(clubs.map(c=>[c.id,{id:c.id,w:0,d:0,l:0,gf:0,ga:0,ovr:c.id===emblem?null:clubStrengths[c.id]}]));
+}
+function standings(s){
+ const league=s.run?.league??s.lastLeague;
+ const table=league?.table??tableFor(s.emblem);
+ return Object.values(table).map(row=>({...row,played:row.w+row.d+row.l,points:row.w*3+row.d,gd:row.gf-row.ga}))
+  .sort((a,b)=>b.points-a.points||b.w-a.w||b.gd-a.gd||b.gf-a.gf||getClub(a.id).name.localeCompare(getClub(b.id).name,"pt-BR"));
+}
+function simulateGoals(mean){
+ const threshold=Math.exp(-mean);
+ let goals=0, chance=Math.random();
+ while(chance>threshold){goals++;chance*=Math.random();}
+ return goals;
+}
+function leagueRound(s,score){
+ const {league,played}=s.run;
+ const fixtures=league.fixtures[played-1];
+ const table=league.table;
+ const ownOvr=rating(s);
+ table[s.emblem].ovr=ownOvr;
+ league.results=fixtures.map(([home,away])=>{
+  const ownGame=home===s.emblem||away===s.emblem;
+  const margin=(table[home].ovr-table[away].ovr)*.045;
+  const [hg,ag]=ownGame?(home===s.emblem?score:[score[1],score[0]]):[
+   simulateGoals(clamp(1.38+margin,.35,3.2)),
+   simulateGoals(clamp(1.13-margin,.35,3.2))
+  ];
+  table[home].gf+=hg;table[home].ga+=ag;
+  table[away].gf+=ag;table[away].ga+=hg;
+  if(hg===ag){table[home].d++;table[away].d++;}
+  else if(hg>ag){table[home].w++;table[away].l++;}
+  else{table[home].l++;table[away].w++;}
+  return {home,away,hg,ag};
+ });
 }
 function fresh(){
  return {version:1,mode:"liga",formation:"4-3-3",draftMode:"position",emblem:"FLA",coach:0,team:[],slots:Array(11).fill(null),bank:24,
-  items:{bicho:1,kit:1,save:1,youth:0,cruise:0,renewal:0},bicho:false,cruise:0,record:{},run:null,draft:null,events:[],log:[],regions:{},streak:0,best:0,wins:0,achievements:{},market:null,last:null,
+  items:{bicho:1,kit:1,save:1,youth:0,cruise:0,renewal:0},bicho:false,cruise:0,record:{},run:null,lastLeague:null,draft:null,events:[],log:[],regions:{},wins:0,market:null,last:null,entered:false,attempt:1,region:null,regionalTitles:[],eventRolled:false,
   firstOpponent:"COR", stadium:"Maracanã",stadiumMode:"every",challenge:"open"};
 }
 function write(s,title,desc,kind="info"){s.log.unshift({title,desc,kind});if(s.log.length>160)s.log.pop();}
-function emptyRole(s,pos){return s.slots.findIndex((id,i)=>!id&&slotRoles(s.formation)[i]===pos);}
+function emptyRole(s,pos){return starters(s).findIndex((p,i)=>!p&&slotRoles(s.formation)[i]===pos);}
 function recruit(s,p){
  if(s.team.some(x=>x.id===p.id))return;
  const ready=live(p);
@@ -122,7 +180,8 @@ function auto(s){
  });
 }
 function proposedRole(s){
- const open=slotRoles(s.formation).filter((_,i)=>!s.slots[i]);
+ const current=starters(s);
+ const open=slotRoles(s.formation).filter((_,i)=>!current[i]);
  return choose(open.length?open:Object.keys(role));
 }
 function draft(s,pos){
@@ -138,17 +197,25 @@ function draft(s,pos){
 }
 function start(s){
  if(s.run)return;
- const seq=calendar(s.mode,s.emblem);
- if(s.mode==="liga"&&s.firstOpponent!==s.emblem&&s.firstOpponent){
-  const n=seq.indexOf(s.firstOpponent);
-  if(n>=0){const first=seq[n];seq.splice(n,1);seq.unshift(first);}
+ const first=opponent(s)?.id;
+ const league=s.mode==="liga"?{fixtures:leagueCalendar(s.emblem,first),table:tableFor(s.emblem),results:[],emblem:s.emblem}:null;
+ const seq=league?league.fixtures.map(fixtures=>fixtures.find(pair=>pair.includes(s.emblem)).find(id=>id!==s.emblem)):
+  s.mode==="regional"?mix(regionalClubs(s)).map(c=>c.id):calendar(s.mode,s.emblem);
+ if(first&&!league){
+  const index=seq.indexOf(first);
+  if(index>=0)seq.unshift(...seq.splice(index,1));
+  else if(s.mode==="copa"){seq.unshift(first);seq.pop();}
  }
  s.run={mode:s.mode,seq,played:0,w:0,d:0,l:0,done:false,won:false};
+ if(league)s.run.league=league;
  s.firstOpponent=null;
 }
 function opponent(s){
  if(s.run?.done)return null;
- return getClub(s.run?.seq[s.run.played]??(s.firstOpponent===s.emblem?"FLA":s.firstOpponent)??(s.emblem==="FLA"?"COR":"FLA"));
+ if(!s.run&&s.mode==="regional")return regionalClubs(s).find(c=>c.id===s.firstOpponent)??regionalClubs(s)[0];
+ if(!s.run&&s.mode==="lib")return getClub("BOC");
+ const first=s.firstOpponent!==s.emblem?s.firstOpponent:null;
+ return getClub(s.run?.seq[s.run.played]??first??(s.emblem==="FLA"?"COR":"FLA"));
 }
 function isDerby(s,other){
  const own=getClub(s.emblem);
@@ -157,18 +224,25 @@ function isDerby(s,other){
 }
 const starters=s=>s.slots.map(id=>s.team.find(p=>p.id===id&&healthy(p))??null);
 const rating=s=>Math.round(starters(s).reduce((sum,p)=>sum+(p?.ovr??0),0)/11);
+const opponentRating=(s,other)=>s.mode==="liga"?clubStrengths[other.id]:other.ovr;
 function odds(s,other){
  const eleven=starters(s).filter(Boolean);
  if(!eleven.length||!other)return 0;
  const effective=eleven.reduce((sum,p)=>sum+p.ovr-p.streak*.8-(p.unhappy?3:0)+(p.bonus||0)+(p.generated?(coaches[s.coach]?.youth??0):0),0)/eleven.length;
  const coach=coaches[s.coach];
- return clamp(.64+(effective-other.ovr)*.019+(coach?.win??0)+(isDerby(s,other)?(coach?.derby??0)-.025:0)+(s.bicho?.15:0)+(s.cruise?.08:0)+(s.stadium===getClub(s.emblem)?.stadium?0.04:0),.13,.995);
+ return clamp(.64+(effective-opponentRating(s,other))*.019+(coach?.win??0)+(isDerby(s,other)?(coach?.derby??0)-.025:0)+(s.bicho?.15:0)+(s.cruise?.08:0)+(s.stadium===getClub(s.emblem)?.stadium?0.04:0),.13,.995);
+}
+function probabilities(s,rival){
+ const win=odds(s,rival), draw=s.mode==="liga"?(1-win)*.52:0;
+ return {win,draw,loss:1-win-draw};
 }
 function complete(s,won){
  const r=s.run;
  r.done=true;r.won=won;
- const best=s.record[r.mode]??{title:false,perfect:false,w:0};
- s.record[r.mode]={title:best.title||won,perfect:best.perfect||(r.mode==="liga"&&r.w===38),w:Math.max(best.w,r.w)};
+ if(r.mode==="regional"&&won&&!s.regionalTitles.includes(s.region))s.regionalTitles.push(s.region);
+ const best=s.record[r.mode]??{title:false,w:0};
+ s.record[r.mode]={title:best.title||won,w:Math.max(best.w,r.w)};
+ if(r.league)s.lastLeague={emblem:r.league.emblem,table:r.league.table,results:r.league.results};
  write(s,won?"Campeão de "+modes[r.mode].name:"Campanha encerrada",r.w+" vitórias, "+r.d+" empates e "+r.l+" derrotas.",won?"good":"bad");
 }
 function addEvent(s,other){
@@ -177,7 +251,7 @@ function addEvent(s,other){
  const p=choose(candidates.filter(p=>p.unhappy))??choose(candidates);
  const next=choose(["agent","sale","trade","board","legend"]);
  if((next==="sale"||next==="trade")&&s.team.length<12)return;
- const reinforcement=choose(players.filter(x=>!s.team.some(y=>y.id===x.id)&&(!p||x.pos===p.pos)));
+ const reinforcement=choose(players.filter(x=>!s.team.some(y=>y.id===x.id)&&!s.events.some(e=>e.incoming?.id===x.id)&&(!p||x.pos===p.pos)));
  const events={
   agent:{type:"agent",title:"Empresário bateu à porta",desc:"Pague R$ 3 mi para conhecer a aposta dele. 20% de raro, 35% de bagre e 45% de titular."},
   sale:{type:"sale",id:p?.id,title:"Venda forçada",desc:p?.name+" entrou na mira de outro clube. A diretoria aceitou R$ 8 mi."},
@@ -185,23 +259,24 @@ function addEvent(s,other){
   board:{type:"board",title:"Patrocínio regional",desc:"A vitória no estádio de "+other.name+" rendeu R$ 4 mi extras."},
   legend:{type:"legend",title:"Ídolo disponível",desc:"Um ícone quer voltar aos gramados. Contrate por R$ 10 mi."}
  };
- s.events.push(events[next]);
+ if(next!=="trade"||reinforcement)s.events.push(events[next]);
 }
-function play(s){
+function play(s,roll=Math.random()){
  const next=opponent(s), selected=starters(s);
  if(!next||s.events.some(e=>["sale","trade","exit"].includes(e.type))||selected.some(p=>!p)||s.bank<0)return null;
  if((s.challenge==="sub78"&&rating(s)>78)||(s.challenge==="elite"&&rating(s)<80))return null;
  if(!s.run)start(s);
  const r=s.run, rival=opponent(s);
  if(!rival)return null;
- const chance=odds(s,rival), roll=Math.random();
- const result=roll<chance?"V":roll<chance+(1-chance)*.52&&s.mode==="liga"?"E":"D";
+ const {win,draw}=probabilities(s,rival);
+ const result=roll<win?"V":roll<win+draw?"E":"D";
  const goals=Math.floor(Math.random()*3), score=result==="V"?[goals+1,goals]:result==="E"?[goals,goals]:[goals,goals+1];
  const cash=result==="V"?6:result==="E"?2:0;
  s.bank+=cash-1;
  r.played++;
  r[result==="V"?"w":result==="E"?"d":"l"]++;
- s.bicho=false;s.cruise=Math.max(0,s.cruise-1);
+ if(r.league)leagueRound(s,score);
+ s.bicho=false;s.eventRolled=false;s.cruise=Math.max(0,s.cruise-1);
  const active=new Set(selected.map(p=>p.id)), injuries=[];
  for(const p of s.team){
   if(active.has(p.id)){
@@ -216,20 +291,21 @@ function play(s){
    else p.bench++;
   }
   p.contract=Math.max(0,p.contract-1);
-  if(p.bench>=6)p.unhappy=true;
+  if(p.contract===0||p.bench>=6)p.unhappy=true;
  }
  const departure=s.team.find(p=>p.unhappy&&(p.bench>=10||p.contract===0)&&!s.events.some(e=>e.id===p.id));
  if(departure)s.events.push({type:"exit",id:departure.id,title:"Jogador força saída",desc:departure.name+" exige uma solução. Renove o contrato ou aceite R$ 4 mi pela saída."});
  if(r.played%3===0||isDerby(s,rival))addEvent(s,rival);
  if(r.played%7===0)addEvent(s,rival);
  if(result==="V"){
-  s.wins++;s.streak++;s.best=Math.max(s.best,s.streak);
-  if(s.streak>=82)s.achievements.perfect82=true;
-  if(!s.regions[rival.region])s.regions[rival.region]=[];
-  if(!s.regions[rival.region].includes(rival.id))s.regions[rival.region].push(rival.id);
- }else s.streak=0;
- if((s.mode==="copa"&&result==="D")||(s.mode==="lib"&&r.played>6&&result==="D"))complete(s,false);
- else if(r.played===r.seq.length)complete(s,s.mode==="liga"?r.w*3+r.d>=76:s.mode==="lib"?r.w>=10:true);
+  s.wins++;
+  if(rival.region!=="Continental"){
+   if(!s.regions[rival.region])s.regions[rival.region]=[];
+   if(!s.regions[rival.region].includes(rival.id))s.regions[rival.region].push(rival.id);
+  }
+ }
+ if((["copa","regional"].includes(s.mode)&&result==="D")||(s.mode==="lib"&&r.played>6&&result==="D"))complete(s,false);
+ else if(r.played===r.seq.length)complete(s,s.mode==="liga"?standings(s)[0].id===s.emblem:s.mode==="lib"?r.w>=10:true);
  else if(s.mode==="lib"&&r.played===6&&r.w<3)complete(s,false);
  s.last={result,score,rival:rival.id,cash,injuries,stadium:s.stadium,mode:s.mode};
  write(s,(result==="V"?"Vitória":result==="E"?"Empate":"Derrota")+" · "+score.join(" × ")+" "+rival.name,"R$ "+cash+" mi em prêmios. "+(injuries.length?"Lesões: "+injuries.join(", ")+".":""),result==="V"?"good":result==="D"?"bad":"info");
@@ -251,8 +327,11 @@ function market(s){
  if(!s.market)s.market=mix(players.filter(p=>!s.team.some(t=>t.id===p.id))).slice(0,8);
  return s.market;
 }
-function unlocked(s){return !!(s.record.liga?.perfect&&s.record.copa?.title);}
-window.Game={clubs,players,legends,role,formations,coaches,modes,items,getClub,fresh,choose,mix,clamp,slotRoles,recruit,auto,proposedRole,draft,opponent,isDerby,starters,rating,odds,play,remove,renewal,windowOpen,market,unlocked,write};
+function unlocked(s){return !!(s.record.liga?.title&&s.record.copa?.title);}
+window.Game={clubs,players,legends,role,formations,coaches,modes,items,regionalOrder,rounds,getClub,fresh,choose,mix,clamp,slotRoles,recruit,auto,proposedRole,draft,opponent,opponentRating,isDerby,starters,rating,probabilities,standings,play,remove,renewal,windowOpen,market,unlocked,write};
 })();
+
+
+
 
 
